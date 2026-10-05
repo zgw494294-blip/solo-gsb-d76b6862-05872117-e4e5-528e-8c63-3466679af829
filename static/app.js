@@ -1,0 +1,1299 @@
+"use strict";
+
+const MAX_RUNNERS = 3;
+const MAX_RECORDS = 40;
+const GATE_LABELS = { S: "起点 S", M: "中途门 M", F: "终点 F" };
+
+/* ---------- 选手行编号追踪与罚秒归属（须先于所有事件监听与行创建声明） ---------- */
+
+// 罚秒只绑定选手编号，仅用于名次表：不改变采纳记录、裁决用时或人工复核。
+// 仅保存在页面内存中，刷新页面即全部清除。
+// 键是规范十进制字符串（见 parseRunnerNumber）：任意大的编号都精确区分，
+// 9007199254740992 与 9007199254740993 的罚秒互不混同。
+const penalties = new Map(); // runnerNumberText -> { seconds: number, reason: string }
+const MAX_PENALTY_REASON = 200;
+
+// 按“行”追踪每行当前登记的编号（规范十进制字符串，空/非法为 null）。罚秒虽按编号保存，
+// 但编号的归属跟随行：一行离开旧编号（改号、清空、删行）的那一刻，旧编号的
+// 罚秒必须立即释放——即使另一行仍占用该编号（临时重号），也不等重算、不看合法性。
+const runnerRowNumbers = new WeakMap();
+
+// 选手编号在页面内一律表示为“规范十进制字符串”（去掉前导零），不经过 Number：
+// 后端接受任意大的正整数编号，而 JS 的 Number 会把 9007199254740993 截断成
+// 9007199254740992，直接用数字会把不同编号混同。
+// 前导零等值写法（如 "007" 与 "7"）归一为同一编号，不算改号。
+function parseRunnerNumber(value) {
+  return /^\d+$/.test(value) ? value.replace(/^0+(?=\d)/, "") : null;
+}
+
+/* ---------- 任意精度秒数：页面内一律使用规范十进制字符串，绝不经过 Number ---------- */
+
+// 后端按任意精度 int 接收秒数并在响应里以 JSON 数字原样返回，秒数同样可以超过
+// JS 安全整数范围（如 9007199254741003）。Number 会把它截断成 9007199254741004：
+// 三条相差均为 11 秒的秒数会被算成 12、10，导致页面展示错误，并让复核绑定的
+// 秒数/两段耗时核对在无关编辑后误判失效。因此响应处理、页面展示、复核绑定与
+// 名次计算中的秒数及差值全部使用规范十进制字符串（去掉前导零），不缩小取值范围。
+function intToText(value) {
+  if (typeof value === "number") {
+    // 无损解析器只对安全整数返回 number；其余一律视为不可信，不静默截断。
+    if (!Number.isSafeInteger(value)) return null;
+    return String(value);
+  }
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    return value.replace(/^0+(?=\d)/, ""); // "0011" 与 "11" 等值，按数值归一
+  }
+  return null;
+}
+
+function isIntText(value) {
+  return typeof value === "string" && /^\d+$/.test(value);
+}
+
+// 两个非负十进制整数精确相减（约定 a >= b），返回规范十进制字符串。
+function subtractIntText(a, b) {
+  return (BigInt(a) - BigInt(b)).toString();
+}
+
+// 非负十进制整数字符串的数值比较，任意精度：-1 / 0 / 1。
+function cmpIntText(a, b) {
+  const x = BigInt(a);
+  const y = BigInt(b);
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
+function releaseRunnerPenalty(number) {
+  if (number !== null) penalties.delete(number);
+}
+
+const runnerRows = document.getElementById("runner-rows");
+const recordRows = document.getElementById("record-rows");
+const addRunnerBtn = document.getElementById("add-runner");
+const addRecordBtn = document.getElementById("add-record");
+const recordCount = document.getElementById("record-count");
+const form = document.getElementById("judge-form");
+const errorBox = document.getElementById("error-box");
+const pendingHint = document.getElementById("pending-hint");
+const resultsBox = document.getElementById("results");
+const diagnosisBox = document.getElementById("diagnosis-box");
+
+/* ---------- 行管理 ---------- */
+
+function runnerRowHtml(index, value = "") {
+  return `
+    <div class="runner-row" data-index="${index}">
+      <span class="row-index">选手 ${index}</span>
+      <input type="number" min="1" step="1" class="runner-number" value="${escapeAttr(value)}" placeholder="正整数编号" />
+      <button type="button" class="btn danger remove-runner" ${index === 1 ? "hidden" : ""}>删除</button>
+    </div>`;
+}
+
+function recordRowHtml() {
+  return `
+    <tr class="record-row">
+      <td><input type="text" class="rec-id" placeholder="唯一 ID" /></td>
+      <td><input type="number" min="1" step="1" class="rec-runner" placeholder="选手编号" /></td>
+      <td>
+        <select class="rec-gate">
+          <option value="">选择门</option>
+          <option value="S">S 起点</option>
+          <option value="M">M 中途门</option>
+          <option value="F">F 终点</option>
+        </select>
+      </td>
+      <td><input type="number" min="0" step="1" class="rec-time" placeholder="非负秒" /></td>
+      <td><button type="button" class="btn danger remove-record">×</button></td>
+    </tr>`;
+}
+
+function addRunnerRow(value) {
+  if (runnerRows.children.length >= MAX_RUNNERS) return;
+  runnerRows.insertAdjacentHTML("beforeend", runnerRowHtml(runnerRows.children.length + 1, value));
+  // 新行从诞生起登记当前编号（载入示例时即为示例编号）：此后该行改号时，
+  // 才能按“行”识别出它离开的旧编号并立即释放对应罚秒。
+  const row = runnerRows.children[runnerRows.children.length - 1];
+  runnerRowNumbers.set(row, parseRunnerNumber(row.querySelector(".runner-number").value));
+  refreshRunnerButtons();
+}
+
+function refreshRunnerButtons() {
+  [...runnerRows.children].forEach((row, i) => {
+    row.dataset.index = i + 1;
+    row.querySelector(".row-index").textContent = `选手 ${i + 1}`;
+    const btn = row.querySelector(".remove-runner");
+    btn.hidden = runnerRows.children.length === 1;
+  });
+  addRunnerBtn.disabled = runnerRows.children.length >= MAX_RUNNERS;
+}
+
+function addRecordRow() {
+  if (recordRows.children.length >= MAX_RECORDS) return;
+  recordRows.insertAdjacentHTML("beforeend", recordRowHtml());
+  refreshRecordCount();
+}
+
+function refreshRecordCount() {
+  recordCount.textContent = `${recordRows.children.length} / ${MAX_RECORDS}`;
+  addRecordBtn.disabled = recordRows.children.length >= MAX_RECORDS;
+}
+
+addRunnerBtn.addEventListener("click", () => {
+  addRunnerRow();
+  onInputChanged();
+});
+addRecordBtn.addEventListener("click", () => {
+  addRecordRow();
+  onInputChanged();
+});
+
+runnerRows.addEventListener("click", (e) => {
+  if (e.target.classList.contains("remove-runner")) {
+    const row = e.target.closest(".runner-row");
+    // 行删除先于 remove() 执行：此刻立即释放该行原编号的罚秒，
+    // 即使另一行仍占用同一编号、输入非法或尚未重算。
+    releasePenaltyForRemovedRunner(row);
+    row.remove();
+    refreshRunnerButtons();
+    onInputChanged();
+  }
+});
+recordRows.addEventListener("click", (e) => {
+  if (e.target.classList.contains("remove-record")) {
+    e.target.closest(".record-row").remove();
+    refreshRecordCount();
+    onInputChanged();
+  }
+});
+
+/* ---------- 输入修改后自动重算 ---------- */
+
+// 每次修改递增版本号：只有版本仍最新的响应才允许更新结果或错误，
+// 过期的成功与失败一律丢弃，不得覆盖较新状态。
+let inputVersion = 0;
+// 裁决序号：每次发起裁决（防抖自动重算或手动点击“裁决 / 重新计算”）递增。
+// 输入未变的手动重算不会改变版本号，但同样是新一次裁决：只有序号仍最新的
+// 裁决响应才允许更新界面并恢复诊断入口；序号变化前发出的诊断响应一律作废。
+let adjudicationSeq = 0;
+let debounceTimer = null;
+const DEBOUNCE_MS = 350; // 合并连续编辑为一次重算
+
+function clearOutcome() {
+  // 每次修改立即清掉旧结果与旧错误。
+  resultsBox.innerHTML = "";
+  errorBox.hidden = true;
+  renderedLapKeys = []; // 结果区已清空，旧的趟键索引全部失效
+  latestResult = null; // 名次表随之隐藏，等待最新合法结果
+  closeDiagnosis(); // 诊断附属于当前裁决结果：输入一改即清除，非法/重算期间不可检查
+}
+
+/* ---------- 未采纳记录替代性诊断（HTTP 只读分析，不改变采纳/复核/罚秒/名次） ---------- */
+
+// 诊断状态机（status）：
+//   idle     存在最新合法裁决，可点击“检查替代性”
+//   loading  诊断请求在途：禁用按钮，不再发起新诊断
+//   done     诊断成功并展示（可能含各档分类与同优替代方案）
+//   error    诊断请求失败（服务报错或无法连接），可重试
+// 诊断不写入裁决结果区：只渲染独立的 #diagnosis-box。
+// 入口开关（diagnosisOpen）：仅“最新一次裁决已完成且合法”时打开；
+// 每次裁决开始（含输入未变的手动重算）立即关闭并清除旧诊断，裁决失败保持关闭；
+// 输入变更/清空同样关闭。inputVersion 与 adjudicationSeq 双重守卫保证：
+// 重算前发出的诊断无论何时结束（成功、服务报错或断网）都不会重新显示结果或错误，
+// 也不会改写重算后新诊断的在途、成功、失败状态。
+let diagnosisState = { status: "idle" };
+let diagnosisOpen = false;
+// 仅供无浏览器生命周期测试直接读取/驱动诊断状态。
+if (typeof globalThis !== "undefined") {
+  globalThis.__getDiagnosisStateForTest = () => diagnosisState;
+  globalThis.__runDiagnosisForTest = () => runDiagnosis();
+}
+
+function onInputChanged() {
+  inputVersion += 1;
+  // 先按当前输入即时丢弃绑定已失效的复核：不必、也不能等到合法裁决返回。
+  pruneReviewsByBindings();
+  // 选手编号被修改或选手被删除时，对应罚秒也在此刻立即清除（改回不恢复）。
+  prunePenaltiesByRunners();
+  clearOutcome();
+  pendingHint.hidden = false;
+  if (debounceTimer) clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => {
+    debounceTimer = null;
+    runAdjudication();
+  }, DEBOUNCE_MS);
+}
+
+form.addEventListener("input", onInputChanged);
+form.addEventListener("change", onInputChanged);
+
+/* ---------- 收集与提交 ---------- */
+
+function collectPayload() {
+  const runners = [...runnerRows.querySelectorAll(".runner-row")]
+    .map((row) => row.querySelector(".runner-number").value.trim())
+    .filter((v) => v !== "")
+    .map((v) => ({ number: v }));
+
+  const records = [...recordRows.querySelectorAll(".record-row")].map((row) => ({
+    id: row.querySelector(".rec-id").value.trim(),
+    runner: row.querySelector(".rec-runner").value.trim(),
+    gate: row.querySelector(".rec-gate").value,
+    time: row.querySelector(".rec-time").value.trim(),
+  }));
+
+  return {
+    standards: {
+      smMin: document.getElementById("smMin").value.trim(),
+      smMax: document.getElementById("smMax").value.trim(),
+      mfMin: document.getElementById("mfMin").value.trim(),
+      mfMax: document.getElementById("mfMax").value.trim(),
+    },
+    runners,
+    records,
+  };
+}
+
+/* ---------- 大整数无损 JSON 解析与结果规范化 ---------- */
+
+// 后端接受任意精度的编号与秒数，响应里的 runner 与各 time/耗时字段都可能超出
+// JS 安全整数范围（如编号 9007199254740993、秒数 9007199254741003）。直接
+// JSON.parse 会把编号截断成 9007199254740992（不同编号混同），也会把秒数
+// 9007199254741003 截断成 9007199254741004（11 秒差值被算成 12/10）。这里用
+// 一个小型解析器代替 JSON.parse：行为与 JSON.parse 一致，唯一区别是超出安全
+// 整数范围的整数字面量解析为规范十进制字符串（去掉前导零），不丢失任何精度；
+// 之后编号与秒数分别在 normalizeResult 中按字符串保留，不回退为 Number。
+function parseJsonLossless(text) {
+  let pos = 0;
+  const fail = () => {
+    throw new SyntaxError("裁决服务返回了无法解析的响应");
+  };
+  const skipWs = () => {
+    while (pos < text.length && " \t\n\r".indexOf(text[pos]) !== -1) pos += 1;
+  };
+  const parseString = () => {
+    // 调用时 text[pos] 为起始双引号
+    let out = "";
+    pos += 1;
+    while (pos < text.length) {
+      const c = text[pos];
+      pos += 1;
+      if (c === '"') return out;
+      if (c === "\\") {
+        if (pos >= text.length) fail();
+        const esc = text[pos];
+        pos += 1;
+        if (esc === "u") {
+          const hex = text.slice(pos, pos + 4);
+          if (!/^[0-9a-fA-F]{4}$/.test(hex)) fail();
+          out += String.fromCharCode(parseInt(hex, 16));
+          pos += 4;
+        } else {
+          const simple = {
+            '"': '"', "\\": "\\", "/": "/",
+            b: "\b", f: "\f", n: "\n", r: "\r", t: "\t",
+          };
+          if (!(esc in simple)) fail();
+          out += simple[esc];
+        }
+      } else {
+        out += c;
+      }
+    }
+    fail();
+  };
+  const parseNumber = () => {
+    const start = pos;
+    if (text[pos] === "-") pos += 1;
+    while (pos < text.length && text[pos] >= "0" && text[pos] <= "9") pos += 1;
+    let isInteger = true;
+    if (text[pos] === ".") {
+      isInteger = false;
+      pos += 1;
+      while (pos < text.length && text[pos] >= "0" && text[pos] <= "9") pos += 1;
+    }
+    if (text[pos] === "e" || text[pos] === "E") {
+      isInteger = false;
+      pos += 1;
+      if (text[pos] === "+" || text[pos] === "-") pos += 1;
+      while (pos < text.length && text[pos] >= "0" && text[pos] <= "9") pos += 1;
+    }
+    const raw = text.slice(start, pos);
+    if (raw === "" || raw === "-") fail();
+    const num = Number(raw);
+    // 超出安全整数范围的整数字面量：保留规范十进制字符串，精度无损。
+    if (isInteger && !Number.isSafeInteger(num)) {
+      return raw.replace(/^(-?)0+(?=\d)/, "$1");
+    }
+    return num;
+  };
+  const parseLiteral = (word, value) => {
+    if (text.slice(pos, pos + word.length) !== word) fail();
+    pos += word.length;
+    return value;
+  };
+  function parseValue() {
+    skipWs();
+    if (pos >= text.length) fail();
+    const c = text[pos];
+    if (c === '"') return parseString();
+    if (c === "{") {
+      pos += 1;
+      const obj = {};
+      skipWs();
+      if (text[pos] === "}") {
+        pos += 1;
+        return obj;
+      }
+      for (;;) {
+        skipWs();
+        if (text[pos] !== '"') fail();
+        const key = parseString();
+        skipWs();
+        if (text[pos] !== ":") fail();
+        pos += 1;
+        obj[key] = parseValue();
+        skipWs();
+        if (text[pos] === ",") {
+          pos += 1;
+          continue;
+        }
+        if (text[pos] === "}") {
+          pos += 1;
+          return obj;
+        }
+        fail();
+      }
+    }
+    if (c === "[") {
+      pos += 1;
+      const arr = [];
+      skipWs();
+      if (text[pos] === "]") {
+        pos += 1;
+        return arr;
+      }
+      for (;;) {
+        arr.push(parseValue());
+        skipWs();
+        if (text[pos] === ",") {
+          pos += 1;
+          continue;
+        }
+        if (text[pos] === "]") {
+          pos += 1;
+          return arr;
+        }
+        fail();
+      }
+    }
+    if (c === "t") return parseLiteral("true", true);
+    if (c === "f") return parseLiteral("false", false);
+    if (c === "n") return parseLiteral("null", null);
+    return parseNumber();
+  }
+  const value = parseValue();
+  skipWs();
+  if (pos !== text.length) fail();
+  return value;
+}
+
+// 裁决结果规范化：
+// - 选手编号统一为规范十进制字符串（任意大都无损）；
+// - 所有秒数与耗时（记录秒数、两段耗时、总用时、未采纳记录秒数）统一为规范
+//   十进制字符串：不经过 Number，超过 2^53 的值与 11 秒这类差值都保持精确；
+// - 只有计次数（至多 40）还原为 Number。
+function normalizeResult(result) {
+  const asText = (v) => intToText(v);
+  for (const r of result.runners) {
+    r.runner = typeof r.runner === "string" ? r.runner : String(r.runner);
+    r.lapCount = typeof r.lapCount === "string" ? Number(r.lapCount) : r.lapCount;
+    r.totalTime = asText(r.totalTime);
+    for (const lap of r.laps) {
+      lap.start.time = asText(lap.start.time);
+      lap.middle.time = asText(lap.middle.time);
+      lap.finish.time = asText(lap.finish.time);
+      lap.smTime = asText(lap.smTime);
+      lap.mfTime = asText(lap.mfTime);
+      lap.totalTime = asText(lap.totalTime);
+    }
+    for (const u of r.unused) {
+      u.time = asText(u.time);
+    }
+  }
+  return result;
+}
+
+async function runAdjudication() {
+  const version = inputVersion;
+  const seq = ++adjudicationSeq;
+  // 每次裁决开始（含输入未变的手动重算）：立即清除旧诊断并禁止检查；
+  // 只有本次（最新）合法裁决完成才由 renderResults 恢复入口，裁决失败保持不可检查。
+  closeDiagnosis();
+  let resp;
+  let data;
+  try {
+    resp = await fetch("/api/adjudicate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(collectPayload()),
+    });
+    // 用无损解析代替 resp.json()：大整数编号不会被浮点精度截断。
+    data = parseJsonLossless(await resp.text());
+  } catch (err) {
+    if (version !== inputVersion || seq !== adjudicationSeq) return; // 过期的失败不得覆盖较新状态
+    pendingHint.hidden = true;
+    resultsBox.innerHTML = "";
+    latestResult = null;
+    showError(`无法连接裁决服务：${err.message}`);
+    return;
+  }
+  if (version !== inputVersion || seq !== adjudicationSeq) return; // 过期的成功同样丢弃
+  pendingHint.hidden = true;
+  if (!resp.ok || !data.ok) {
+    // 非法输入：清空结果区，只显示错误（不展示部分结果）。
+    resultsBox.innerHTML = "";
+    latestResult = null;
+    showError(data.error || "裁决失败");
+  } else {
+    errorBox.hidden = true;
+    renderResults(normalizeResult(data.result));
+  }
+}
+
+// 手动裁决按钮仍然可用：跳过防抖立即重算，等待期间不锁定任何输入。
+// 输入未变的手动重算同样是新一次裁决：runAdjudication 内会立即清除旧诊断
+// 并禁止检查，只有最新合法裁决完成才恢复诊断入口。
+form.addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (debounceTimer) {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+  }
+  pendingHint.hidden = false;
+  runAdjudication();
+});
+
+function showError(msg) {
+  errorBox.textContent = `⚠ ${msg}`;
+  errorBox.hidden = false;
+}
+
+/* ---------- 人工复核（仅本次页面会话，不上传、不影响裁决） ---------- */
+
+// 复核绑定具体的“趟”：选手编号 + 三条记录的 ID/门/秒数 + 该趟两段耗时 + 两段耗时区间，
+// 不按趟序号或记录行号定位。仅保存在页面内存中，刷新页面即全部清除。
+const reviews = new Map(); // key -> { status: "pending"|"pass"|"doubt", note: string }
+const REVIEW_STATUSES = { pending: "未复核", pass: "通过", doubt: "存疑" };
+const MAX_REVIEW_NOTE = 200;
+// 最近一次渲染的趟绑定键（与 DOM 中 data-key-index 一一对应），仅供保存时回查。
+let renderedLapKeys = [];
+
+// 区间绑定值同样是任意精度的非负整数：以规范十进制字符串参与键的生成与核对，
+// 不经过 Number（非法/清空为 null，与所有规范文本都不相等，绑定随即失效）。
+function currentStandards() {
+  return ["smMin", "smMax", "mfMin", "mfMax"].map((id) =>
+    intToText(document.getElementById(id).value.trim())
+  );
+}
+
+function lapReviewKey(runner, lap, standards) {
+  return JSON.stringify([
+    runner,
+    [lap.start.id, "S", lap.start.time],
+    [lap.middle.id, "M", lap.middle.time],
+    [lap.finish.id, "F", lap.finish.time],
+    lap.smTime,
+    lap.mfTime,
+    standards,
+  ]);
+}
+
+// 即时剪枝：任一绑定值改变、绑定记录或选手被删除（含当前输入非法、尚在防抖、
+// 请求在途的情形），对应复核此刻就丢弃；之后改回或过期响应返回也不会恢复。
+// 只逐条核对绑定本身：重排记录、增删改无关记录的趟不受影响，保留原状态与备注。
+function pruneReviewsByBindings() {
+  const standards = currentStandards();
+
+  const runnerNumbers = new Set(
+    [...runnerRows.querySelectorAll(".runner-number")]
+      .map((el) => parseRunnerNumber(el.value.trim()))
+      .filter((v) => v !== null)
+  );
+
+  // 以记录 ID 为索引：绑定按 ID 定位，ID 缺失即记录被删除；
+  // 同一 ID 出现多行时无法唯一定位原记录，同样视为绑定失效。
+  const recordsById = new Map();
+  const duplicatedIds = new Set();
+  for (const row of recordRows.querySelectorAll(".record-row")) {
+    const id = row.querySelector(".rec-id").value.trim();
+    if (id === "") continue;
+    if (recordsById.has(id)) {
+      duplicatedIds.add(id);
+      continue;
+    }
+    recordsById.set(id, {
+      runner: row.querySelector(".rec-runner").value.trim(),
+      gate: row.querySelector(".rec-gate").value,
+      time: row.querySelector(".rec-time").value.trim(),
+    });
+  }
+
+  // 输入行的秒数也规范为十进制字符串：与绑定键中的规范秒数按文本精确比较，
+  // 前导零等值写法不算改变，超过 2^53 的秒数同样逐位精确，不经过 Number。
+  const recordMatches = (rec, gate, time) =>
+    rec !== undefined &&
+    rec.gate === gate &&
+    intToText(rec.time) === time;
+
+  for (const key of [...reviews.keys()]) {
+    let parts;
+    try {
+      parts = JSON.parse(key);
+    } catch (err) {
+      reviews.delete(key); // 结构不符的键一律视为失效
+      continue;
+    }
+    const [
+      runner,
+      [sId, sGate, sTime],
+      [mId, mGate, mTime],
+      [fId, fGate, fTime],
+      smTime,
+      mfTime,
+      boundStandards,
+    ] = parts;
+
+    // 结构与类型守卫：绑定值必须是规范十进制字符串（由规范化后的响应生成），
+    // 任何历史/损坏键都立即丢弃，不参与任何 Number 运算。
+    const structurallyOk =
+      typeof runner === "string" &&
+      [sId, mId, fId].every((v) => typeof v === "string") &&
+      [sGate, mGate, fGate].every((v) => typeof v === "string") &&
+      [sTime, mTime, fTime, smTime, mfTime].every(isIntText) &&
+      Array.isArray(boundStandards);
+    if (!structurallyOk) {
+      reviews.delete(key);
+      continue;
+    }
+
+    let valid =
+      JSON.stringify(boundStandards) === JSON.stringify(standards) &&
+      runnerNumbers.has(runner) &&
+      !duplicatedIds.has(sId) &&
+      !duplicatedIds.has(mId) &&
+      !duplicatedIds.has(fId) &&
+      sId !== mId &&
+      sId !== fId &&
+      mId !== fId &&
+      recordMatches(recordsById.get(sId), sGate, sTime) &&
+      recordMatches(recordsById.get(mId), mGate, mTime) &&
+      recordMatches(recordsById.get(fId), fGate, fTime);
+
+    if (valid) {
+      // 绑定记录的选手编号必须仍是该选手（按规范十进制精确比较，大编号不混同）；
+      // 门/秒数不变时两段耗时自然不变，这里仍用十进制字符串精确核对一次：
+      // 差值按 BigInt 计算，超过 2^53 的秒数与 11 秒这类差值都不会被浮点改写。
+      const sRec = recordsById.get(sId);
+      const mRec = recordsById.get(mId);
+      const fRec = recordsById.get(fId);
+      valid =
+        parseRunnerNumber(sRec.runner.trim()) === runner &&
+        parseRunnerNumber(mRec.runner.trim()) === runner &&
+        parseRunnerNumber(fRec.runner.trim()) === runner &&
+        subtractIntText(mTime, sTime) === smTime &&
+        subtractIntText(fTime, mTime) === mfTime;
+    }
+
+    if (!valid) reviews.delete(key);
+  }
+}
+
+function reviewCurrentText(saved) {
+  const status = saved ? saved.status : "pending";
+  const note = saved ? saved.note : "";
+  const base = `当前：${REVIEW_STATUSES[status]}`;
+  return note ? `${base}（备注：${escapeHtml(note)}）` : base;
+}
+
+function reviewBoxHtml(keyIndex, saved) {
+  const status = saved ? saved.status : "pending";
+  const note = saved ? saved.note : "";
+  const options = Object.entries(REVIEW_STATUSES)
+    .map(
+      ([value, label]) => `
+      <label class="review-option">
+        <input type="radio" name="review-status-${keyIndex}" value="${value}" ${
+        value === status ? "checked" : ""
+      } /> ${label}
+      </label>`
+    )
+    .join("");
+  return `
+  <div class="review-box" data-key-index="${keyIndex}">
+    <div class="review-head">
+      <span class="review-label">人工复核</span>
+      <span class="review-current">${reviewCurrentText(saved)}</span>
+      <span class="review-scope">仅本次页面会话保留，刷新即清除</span>
+    </div>
+    <div class="review-status-row">${options}</div>
+    <textarea class="review-note" rows="2" maxlength="${MAX_REVIEW_NOTE}" placeholder="备注（至多 ${MAX_REVIEW_NOTE} 字；选择“存疑”时必填）">${escapeHtml(note)}</textarea>
+    <div class="review-actions">
+      <button type="button" class="btn secondary review-save">保存复核</button>
+      <span class="review-error" hidden></span>
+    </div>
+  </div>`;
+}
+
+// 保存复核：校验失败时不写入，保持原复核内容不变。
+resultsBox.addEventListener("click", (e) => {
+  if (!e.target.classList.contains("review-save")) return;
+  const box = e.target.closest(".review-box");
+  const key = renderedLapKeys[Number(box.dataset.keyIndex)];
+  if (key === undefined) return; // 结果区已被更新的渲染替换
+  const checked = box.querySelector("input[type=radio]:checked");
+  const status = checked ? checked.value : "pending";
+  const note = box.querySelector(".review-note").value;
+  const errEl = box.querySelector(".review-error");
+
+  const fail = (msg) => {
+    errEl.textContent = `⚠ ${msg}；已保留原复核内容`;
+    errEl.hidden = false;
+  };
+  if (note.length > MAX_REVIEW_NOTE) {
+    fail(`备注至多 ${MAX_REVIEW_NOTE} 字`);
+    return;
+  }
+  if (status === "doubt" && note.trim() === "") {
+    fail("选择“存疑”必须填写非空备注");
+    return;
+  }
+  reviews.set(key, { status, note });
+  errEl.hidden = true;
+  box.querySelector(".review-current").innerHTML = reviewCurrentText({ status, note });
+});
+
+/* ---------- 比赛名次与罚秒（仅本次页面会话，不上传、不影响裁决与复核） ---------- */
+
+// 最近一次展示的合法裁决结果：保存罚秒后据此立即重排名次，无需重新请求。
+let latestResult = null;
+
+// 仅供无浏览器生命周期测试（test_ranking_lifecycle.js）直接断言内存中的罚秒。
+if (typeof globalThis !== "undefined") globalThis.__penaltiesForTest = penalties;
+
+// 删行时（在 DOM remove 之前调用）：该行已不在表单中，直接释放其原编号罚秒。
+function releasePenaltyForRemovedRunner(row) {
+  releaseRunnerPenalty(
+    runnerRowNumbers.has(row)
+      ? runnerRowNumbers.get(row)
+      : parseRunnerNumber(row.querySelector(".runner-number").value)
+  );
+  runnerRowNumbers.delete(row);
+}
+
+// 每次输入变更：逐行比对当前编号与该行上一次登记的编号。
+// 任一行改号——旧编号变成新编号（含另一行仍占用旧编号的临时重号、重号非法、
+// 清空或非法输入）——旧编号的罚秒与原因此刻立即清除；之后改回同编号或重新
+// 添加同编号，行的登记已是新值，旧罚秒不会再被任何后续响应恢复。
+// 未改号的行（记录、区间等编辑）不受影响。
+function prunePenaltiesByRunners() {
+  for (const row of runnerRows.querySelectorAll(".runner-row")) {
+    const input = row.querySelector(".runner-number");
+    const next = parseRunnerNumber(input.value.trim());
+    const prev = runnerRowNumbers.has(row) ? runnerRowNumbers.get(row) : next;
+    if (prev !== next) releaseRunnerPenalty(prev);
+    runnerRowNumbers.set(row, next);
+  }
+  // 防御性兜底：编号已不在任何行中的残余罚秒同样清除。
+  const numbers = new Set(
+    [...runnerRows.querySelectorAll(".runner-number")]
+      .map((el) => parseRunnerNumber(el.value.trim()))
+      .filter((v) => v !== null)
+  );
+  for (const runner of [...penalties.keys()]) {
+    if (!numbers.has(runner)) penalties.delete(runner);
+  }
+}
+
+// 名次：有完整计次者按计次数降序、调整后用时（原总用时 + 罚秒）升序，
+// 同值共享名次并跳号（1、1、3），并列按编号升序展示；
+// 零次者排末尾、按编号升序且无名次。
+// 编号是规范十进制字符串：先比长度、再按字典序即数值升序，任意大都精确。
+function cmpRunnerNumbers(a, b) {
+  return a.length - b.length || (a < b ? -1 : a > b ? 1 : 0);
+}
+
+function computeRanking(runners) {
+  const rows = runners.map((r) => {
+    const saved = penalties.get(r.runner);
+    const penalty = saved ? saved.seconds : 0;
+    // 原总用时是规范十进制字符串（任意精度）；调整后用时按十进制精确相加，
+    // 不经过 Number，避免超过 2^53 的总用时在名次比较中被截断。
+    const adjustedText = (BigInt(r.totalTime) + BigInt(penalty)).toString();
+    return {
+      runner: r.runner,
+      lapCount: r.lapCount,
+      totalTime: r.totalTime,
+      penalty,
+      adjusted: adjustedText,
+      rank: null,
+    };
+  });
+  const ranked = rows
+    .filter((row) => row.lapCount > 0)
+    .sort(
+      (a, b) =>
+        b.lapCount - a.lapCount ||
+        cmpIntText(a.adjusted, b.adjusted) ||
+        cmpRunnerNumbers(a.runner, b.runner)
+    );
+  ranked.forEach((row, i) => {
+    row.rank =
+      i > 0 &&
+      row.lapCount === ranked[i - 1].lapCount &&
+      row.adjusted === ranked[i - 1].adjusted
+        ? ranked[i - 1].rank
+        : i + 1;
+  });
+  const zeros = rows
+    .filter((row) => row.lapCount === 0)
+    .sort((a, b) => cmpRunnerNumbers(a.runner, b.runner));
+  return ranked.concat(zeros);
+}
+
+function rankingTableHtml(result) {
+  const body = computeRanking(result.runners)
+    .map(
+      (row) =>
+        `<tr><td>${row.runner}</td><td>${row.lapCount}</td><td>${row.totalTime} 秒</td><td>${row.penalty} 秒</td><td>${row.adjusted} 秒</td><td>${
+          row.rank === null ? "—" : `第 ${row.rank} 名`
+        }</td></tr>`
+    )
+    .join("");
+  return `<table class="ranking-table">
+    <thead><tr><th>选手编号</th><th>计次数</th><th>原总用时</th><th>罚秒</th><th>调整后用时</th><th>名次</th></tr></thead>
+    <tbody>${body}</tbody>
+  </table>`;
+}
+
+function penaltyCurrentText(saved) {
+  const seconds = saved ? saved.seconds : 0;
+  const reason = saved ? saved.reason : "";
+  const base = `当前已保存：${seconds} 秒`;
+  return reason ? `${base}（原因：${escapeHtml(reason)}）` : base;
+}
+
+function penaltyEditorHtml(runner) {
+  const saved = penalties.get(runner);
+  const seconds = saved ? saved.seconds : 0;
+  const reason = saved ? saved.reason : "";
+  return `
+  <div class="penalty-editor" data-runner="${runner}">
+    <div class="penalty-head">
+      <span class="penalty-label">选手 ${runner} · 罚秒</span>
+      <span class="penalty-current">${penaltyCurrentText(saved)}</span>
+    </div>
+    <div class="penalty-controls">
+      <input type="number" min="0" step="1" class="penalty-seconds" value="${seconds}" />
+      <span class="penalty-unit">秒</span>
+      <input type="text" class="penalty-reason" maxlength="${MAX_PENALTY_REASON}" placeholder="原因（至多 ${MAX_PENALTY_REASON} 字；罚秒大于 0 时必填）" value="${escapeAttr(reason)}" />
+      <button type="button" class="btn secondary penalty-save">保存罚秒</button>
+      <span class="penalty-error" hidden></span>
+    </div>
+  </div>`;
+}
+
+function rankingCardHtml(result) {
+  return `
+  <section class="result-card ranking-card">
+    <div class="result-head">
+      <h3>比赛名次</h3>
+      <span class="review-scope">罚秒仅影响名次表，不改变采纳记录、裁决用时与人工复核；仅本次页面会话保留，刷新即清除</span>
+    </div>
+    <div class="ranking-table-slot">${rankingTableHtml(result)}</div>
+    ${result.runners.map((r) => penaltyEditorHtml(r.runner)).join("")}
+  </section>`;
+}
+
+// 保存罚秒：非负整数、原因至多 200 字、罚秒大于 0 时原因必填；
+// 校验失败不写入，保留原已保存的罚秒与原因；成功后立即重排名次表，无需重算。
+resultsBox.addEventListener("click", (e) => {
+  if (!e.target.classList.contains("penalty-save")) return;
+  const box = e.target.closest(".penalty-editor");
+  if (!box) return;
+  const runner = box.dataset.runner; // 规范十进制字符串：任意大编号都精确归属
+  const secondsText = box.querySelector(".penalty-seconds").value.trim();
+  const reason = box.querySelector(".penalty-reason").value;
+  const errEl = box.querySelector(".penalty-error");
+
+  const fail = (msg) => {
+    errEl.textContent = `⚠ ${msg}；已保留原罚秒和原因`;
+    errEl.hidden = false;
+  };
+  if (!/^\d+$/.test(secondsText)) {
+    fail("罚秒必须是非负整数");
+    return;
+  }
+  if (reason.length > MAX_PENALTY_REASON) {
+    fail(`原因至多 ${MAX_PENALTY_REASON} 字`);
+    return;
+  }
+  const seconds = Number(secondsText);
+  if (seconds > 0 && reason.trim() === "") {
+    fail("罚秒大于 0 时必须填写原因");
+    return;
+  }
+  penalties.set(runner, { seconds, reason });
+  errEl.hidden = true;
+  box.querySelector(".penalty-current").innerHTML = penaltyCurrentText({ seconds, reason });
+  // 罚秒只影响名次表：立即按当前已保存的罚秒重排名次，不触发重新裁决。
+  const slot = resultsBox.querySelector(".ranking-table-slot");
+  if (slot && latestResult) slot.innerHTML = rankingTableHtml(latestResult);
+});
+
+/* ---------- 结果渲染 ---------- */
+
+function gateChip(gate, id, time) {
+  return `<span class="chip ${gate}">
+    <span class="chip-id">${escapeHtml(id)}</span>
+    <span class="chip-t">${GATE_LABELS[gate]} · ${time} 秒</span>
+  </span>`;
+}
+
+function renderResults(result) {
+  latestResult = result; // 名次表与罚秒保存都以这份最新合法结果为准
+  const standards = currentStandards();
+  const keyOf = (runner, lap) => lapReviewKey(runner, lap, standards);
+
+  // 合法裁决到达后再按最新采纳集合剪枝：处理“绑定本身没变、但该趟不再被最新
+  // 合法裁决采纳”的情形；绑定值改变/记录或选手删除已在输入变更瞬间即时丢弃，
+  // 过期响应因版本号守卫根本到不了这里，无法恢复被丢弃的复核。
+  const adopted = new Set();
+  for (const r of result.runners) {
+    for (const lap of r.laps) adopted.add(keyOf(r.runner, lap));
+  }
+  for (const key of [...reviews.keys()]) {
+    if (!adopted.has(key)) reviews.delete(key);
+  }
+
+  renderedLapKeys = [];
+  const runnerCards = result.runners
+    .map((r) => {
+      const badge =
+        r.lapCount === 0
+          ? `<span class="badge zero">0 次完整计次</span>`
+          : `<span class="badge ok">${r.lapCount} 次完整计次</span>`;
+      const meta =
+        r.lapCount === 0
+          ? `<span class="result-meta">无完整计次</span>`
+          : `<span class="result-meta">各趟用时之和：${r.totalTime} 秒</span>`;
+
+      const lapsHtml =
+        r.lapCount === 0
+          ? `<div class="zero-note">该选手没有符合两段耗时区间的完整一趟，计 0 次；全部感应记录列入未采纳。</div>`
+          : r.laps
+              .map((lap, i) => {
+                renderedLapKeys.push(keyOf(r.runner, lap));
+                const reviewHtml = reviewBoxHtml(
+                  renderedLapKeys.length - 1,
+                  reviews.get(renderedLapKeys[renderedLapKeys.length - 1])
+                );
+                return `
+                <div class="lap-item">
+                  <div class="lap-title">第 ${i + 1} 趟 · 总用时 ${lap.totalTime} 秒</div>
+                  <div class="lap-chain">
+                    ${gateChip("S", lap.start.id, lap.start.time)}
+                    <span class="arrow">— ${lap.smTime} 秒 →</span>
+                    ${gateChip("M", lap.middle.id, lap.middle.time)}
+                    <span class="arrow">— ${lap.mfTime} 秒 →</span>
+                    ${gateChip("F", lap.finish.id, lap.finish.time)}
+                  </div>
+                  <div class="seg-times">
+                    起点→中途门 <strong>${lap.smTime}</strong> 秒，
+                    中途门→终点 <strong>${lap.mfTime}</strong> 秒
+                  </div>
+                  ${reviewHtml}
+                </div>`;
+              })
+              .join("");
+
+      const unusedHtml =
+        r.unused.length === 0
+          ? `<span class="empty-line">（无未采纳记录）</span>`
+          : r.unused
+              .map(
+                (u) =>
+                  `<span class="chip-mini ${u.gate}">${GATE_LABELS[u.gate]} · ${escapeHtml(
+                    u.id
+                  )} · ${u.time} 秒</span>`
+              )
+              .join("");
+
+      return `
+      <section class="result-card">
+        <div class="result-head">
+          <h3>选手 ${r.runner}</h3>
+          ${badge}
+          ${meta}
+        </div>
+        <div>${lapsHtml}</div>
+        <div class="subsection">
+          <h4>未采纳记录（该选手输入但未进入任何一趟）</h4>
+          ${unusedHtml}
+        </div>
+      </section>`;
+    })
+    .join("");
+  // 名次表排在最前，使用渲染这一刻已保存的罚秒。
+  resultsBox.innerHTML = rankingCardHtml(result) + runnerCards;
+  // 最新合法裁决到达：诊断入口恢复为可检查的初始态
+  // （每次裁决开始时已在 runAdjudication 清除旧诊断并关闭入口）。
+  openDiagnosis();
+}
+
+/* ---------- 替代性诊断 ---------- */
+
+const DIAG_LABELS = {
+  equal: "同优可替代",
+  inferior: "仅次优可用",
+  unusable: "无法成趟",
+};
+const DIAG_HINTS = {
+  equal: "存在包含该记录、且计次数与原总用时都与现方案相同的合法完整方案（仅 ID 决胜不同；与罚秒无关）",
+  inferior: "该记录能组成合格趟，但任何完整方案的计次数或原总用时都达不到现方案",
+  unusable: "该选手的任何合格趟都不包含这条记录",
+};
+
+function clearDiagnosis() {
+  diagnosisState = { status: "idle" };
+  diagnosisBox.hidden = true;
+  diagnosisBox.innerHTML = "";
+}
+
+// 每次裁决开始（含输入未变的手动重算）与输入变更/清空：清除旧诊断并关闭检查入口。
+function closeDiagnosis() {
+  diagnosisOpen = false;
+  clearDiagnosis();
+}
+
+// 最新合法裁决到达后进入可检查状态（卡片显示、按钮可点，入口重新打开）。
+function openDiagnosis() {
+  diagnosisOpen = true;
+  diagnosisState = { status: "idle" };
+  paintDiagnosis();
+}
+
+// 诊断响应规范化：编号/秒数/总用时一律规范十进制字符串，计次数为 Number；
+// 分类代码只接受三档白名单，其余视为异常响应，避免展示脏数据。
+function normalizeDiagnosis(result) {
+  for (const r of result.runners) {
+    r.runner = typeof r.runner === "string" ? r.runner : String(r.runner);
+    r.lapCount = typeof r.lapCount === "string" ? Number(r.lapCount) : r.lapCount;
+    r.totalTime = intToText(r.totalTime);
+    for (const d of r.diagnoses) {
+      d.time = intToText(d.time);
+      if (!(d.classification in DIAG_LABELS)) {
+        throw new Error("诊断服务返回了无法识别的分类");
+      }
+      if (d.classification === "equal") {
+        const a = d.alternative;
+        if (!a || !Array.isArray(a.recordIds)) throw new Error("同优诊断缺少替代方案");
+        a.lapCount = typeof a.lapCount === "string" ? Number(a.lapCount) : a.lapCount;
+        a.totalTime = intToText(a.totalTime);
+      }
+    }
+  }
+  return result;
+}
+
+async function runDiagnosis() {
+  // 入口关闭（重算在途、非法、清空）、无合法结果、已有诊断在途时都不可检查。
+  if (!diagnosisOpen || diagnosisState.status === "loading" || !latestResult) return;
+  const version = inputVersion;
+  const adjSeq = adjudicationSeq; // 重算一开始（序号递增），本次诊断的响应即作废
+  diagnosisState = { status: "loading" };
+  paintDiagnosis();
+
+  let resp;
+  let data;
+  try {
+    resp = await fetch("/api/diagnose", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // 以当前完整裁决输入发起诊断（与裁决请求同一份载荷）。
+      body: JSON.stringify(collectPayload()),
+    });
+    data = parseJsonLossless(await resp.text());
+  } catch (err) {
+    // 迟到的失败不得覆盖较新状态（含重算后新诊断的在途/成功/失败状态）。
+    if (version !== inputVersion || adjSeq !== adjudicationSeq) return;
+    diagnosisState = { status: "error", message: `无法连接诊断服务：${err.message}` };
+    paintDiagnosis();
+    return;
+  }
+  // 迟到的成功同样丢弃：重算前发出的诊断无论何时结束都不得重新显示，
+  // 也不得改写重算后新诊断的在途、成功、失败状态。
+  if (version !== inputVersion || adjSeq !== adjudicationSeq) return;
+  if (!resp.ok || !data.ok) {
+    // 当前输入本应与已展示的合法裁决一致；服务报错只在诊断卡内呈现，不动采纳结果。
+    diagnosisState = {
+      status: "error",
+      message: (data && data.error) || `诊断失败（HTTP ${resp.status}）`,
+    };
+    paintDiagnosis();
+    return;
+  }
+  try {
+    normalizeDiagnosis(data.result);
+  } catch (err) {
+    diagnosisState = { status: "error", message: err.message };
+    paintDiagnosis();
+    return;
+  }
+  diagnosisState = { status: "done", result: data.result };
+  paintDiagnosis();
+}
+
+function diagnosisHeadHtml() {
+  return `
+    <div class="result-head">
+      <h3>未采纳记录替代性诊断</h3>
+      <span class="review-scope">只读分析：不替换采纳结果，不改变计次、复核、罚秒或名次</span>
+    </div>`;
+}
+
+function diagnosisIdleHtml() {
+  return `
+    ${diagnosisHeadHtml()}
+    <p class="diag-intro">
+      以当前完整裁决输入经 HTTP 诊断每名选手的<strong>未采纳记录</strong>：
+      同优判断只比“计次数 + 原总用时”，不考虑 ID 决胜和罚秒，并给出包含目标记录的整套替代方案。
+    </p>
+    <div class="diag-actions">
+      <button type="button" class="btn primary diagnose-run">🔎 检查替代性</button>
+      <span class="diag-action-hint">仅在当前输入合法且未在重算时可检查；输入一改或重新计算即清除本诊断。</span>
+    </div>`;
+}
+
+function diagnosisLoadingHtml() {
+  return `
+    ${diagnosisHeadHtml()}
+    <div class="diag-loading">
+      <span class="diag-spinner" aria-hidden="true"></span>
+      正在经 HTTP 诊断未采纳记录的替代性…
+    </div>`;
+}
+
+function diagnosisErrorHtml(message) {
+  return `
+    ${diagnosisHeadHtml()}
+    <div class="diag-error">⚠ ${escapeHtml(message)}</div>
+    <div class="diag-actions">
+      <button type="button" class="btn secondary diagnose-run">重试诊断</button>
+    </div>`;
+}
+
+function alternativeHtml(alt, targetId) {
+  // 整套方案的 ID 序列按计次时间顺序排列（每 3 条一趟），目标记录高亮，不只展示单趟。
+  const groups = [];
+  for (let i = 0; i < alt.recordIds.length; i += 3) {
+    const ids = alt.recordIds.slice(i, i + 3);
+    groups.push(
+      `<span class="diag-lap">第 ${i / 3 + 1} 趟：` +
+        ids
+          .map((id) =>
+            id === targetId
+              ? `<strong class="diag-target-id">${escapeHtml(id)}</strong>`
+              : escapeHtml(id)
+          )
+          .join(" → ") +
+        "</span>"
+    );
+  }
+  return `
+    <div class="diag-alt">
+      <div class="diag-alt-meta">
+        整套替代方案：<strong>${alt.lapCount}</strong> 次 · 原总用时
+        <strong>${alt.totalTime}</strong> 秒（与现方案计次数、原总用时相同）
+      </div>
+      <div class="diag-alt-laps">${groups.join("")}</div>
+    </div>`;
+}
+
+function diagnosisItemHtml(item) {
+  return `
+    <div class="diag-item diag-${item.classification}">
+      <div class="diag-item-line">
+        <span class="chip-mini ${item.gate}">${GATE_LABELS[item.gate]} · ${escapeHtml(
+    item.id
+  )} · ${item.time} 秒</span>
+        <span class="diag-badge diag-badge-${item.classification}">${
+    DIAG_LABELS[item.classification]
+  }</span>
+      </div>
+      <div class="diag-hint">${DIAG_HINTS[item.classification]}</div>
+      ${item.classification === "equal" ? alternativeHtml(item.alternative, item.id) : ""}
+    </div>`;
+}
+
+function diagnosisRunnerHtml(r) {
+  const head =
+    r.lapCount === 0
+      ? `选手 ${r.runner} · 现方案 0 次（无完整计次）`
+      : `选手 ${r.runner} · 现方案 ${r.lapCount} 次 · 原总用时 ${r.totalTime} 秒`;
+  const counts = { equal: 0, inferior: 0, unusable: 0 };
+  for (const d of r.diagnoses) counts[d.classification] += 1;
+  const summary =
+    r.diagnoses.length === 0
+      ? ""
+      : `<div class="diag-summary">同优可替代 ${counts.equal} · 仅次优可用 ${counts.inferior} · 无法成趟 ${counts.unusable}</div>`;
+  const body =
+    r.diagnoses.length === 0
+      ? `<div class="empty-line">（无未采纳记录）</div>`
+      : r.diagnoses.map(diagnosisItemHtml).join("");
+  return `
+    <div class="diag-runner">
+      <div class="diag-runner-head">${head}</div>
+      ${summary}
+      ${body}
+    </div>`;
+}
+
+function diagnosisDoneHtml(result) {
+  return `
+    ${diagnosisHeadHtml()}
+    <p class="diag-intro">
+      下列诊断针对当前未采纳记录；诊断为只读结果，采纳方案、人工复核、罚秒与名次均保持不变。
+    </p>
+    ${result.runners.map(diagnosisRunnerHtml).join("")}
+    <div class="diag-actions">
+      <button type="button" class="btn ghost diagnose-rerun">重新诊断</button>
+      <span class="diag-action-hint">修改任意输入或点击重新计算后本诊断立即清除，需在新结果上重新检查。</span>
+    </div>`;
+}
+
+function paintDiagnosis() {
+  // 入口关闭（重算在途、非法、清空）或无合法结果时诊断卡整体隐藏，不可检查。
+  if (!diagnosisOpen || !latestResult) {
+    diagnosisBox.hidden = true;
+    return;
+  }
+  switch (diagnosisState.status) {
+    case "idle":
+      diagnosisBox.innerHTML = diagnosisIdleHtml();
+      break;
+    case "loading":
+      diagnosisBox.innerHTML = diagnosisLoadingHtml();
+      break;
+    case "error":
+      diagnosisBox.innerHTML = diagnosisErrorHtml(diagnosisState.message);
+      break;
+    case "done":
+      diagnosisBox.innerHTML = diagnosisDoneHtml(diagnosisState.result);
+      break;
+  }
+  diagnosisBox.hidden = false;
+}
+
+// 诊断按钮事件委托：loading 态按钮不存在/禁用，入口关闭（重算在途、非法、清空）时
+// 卡片隐藏，皆不可点。
+diagnosisBox.addEventListener("click", (e) => {
+  if (!e.target.classList.contains("diagnose-run") &&
+      !e.target.classList.contains("diagnose-rerun")) {
+    return;
+  }
+  if (!diagnosisOpen || diagnosisState.status === "loading" || !latestResult) return;
+  runDiagnosis();
+});
+
+/* ---------- 工具 ---------- */
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  })[c]);
+}
+function escapeAttr(s) {
+  return escapeHtml(s);
+}
+
+/* ---------- 示例 / 清空 ---------- */
+
+const SAMPLE = {
+  smMin: "10",
+  smMax: "60",
+  mfMin: "10",
+  mfMax: "60",
+  runners: [{ number: "101" }, { number: "102" }],
+  records: [
+    { id: "a1", runner: "101", gate: "S", time: "0" },
+    { id: "b1", runner: "101", gate: "M", time: "12" },
+    { id: "c1", runner: "101", gate: "F", time: "25" },
+    { id: "a2", runner: "101", gate: "S", time: "30" },
+    { id: "b2", runner: "101", gate: "M", time: "45" },
+    { id: "c2", runner: "101", gate: "F", time: "58" },
+    { id: "x1", runner: "101", gate: "M", time: "200" },
+    { id: "x2", runner: "101", gate: "S", time: "31" },
+    { id: "d1", runner: "102", gate: "S", time: "5" },
+    { id: "e1", runner: "102", gate: "M", time: "15" },
+    { id: "f1", runner: "102", gate: "F", time: "25" },
+  ],
+};
+
+function loadSample() {
+  reviews.clear(); // 载入示例同时清掉全部复核记录
+  penalties.clear(); // 同时清掉全部罚秒
+  document.getElementById("smMin").value = SAMPLE.smMin;
+  document.getElementById("smMax").value = SAMPLE.smMax;
+  document.getElementById("mfMin").value = SAMPLE.mfMin;
+  document.getElementById("mfMax").value = SAMPLE.mfMax;
+
+  runnerRows.innerHTML = "";
+  SAMPLE.runners.forEach((r) => addRunnerRow(r.number));
+  refreshRunnerButtons();
+
+  recordRows.innerHTML = "";
+  SAMPLE.records.forEach(() => addRecordRow());
+  [...recordRows.querySelectorAll(".record-row")].forEach((row, i) => {
+    const rec = SAMPLE.records[i];
+    row.querySelector(".rec-id").value = rec.id;
+    row.querySelector(".rec-runner").value = rec.runner;
+    row.querySelector(".rec-gate").value = rec.gate;
+    row.querySelector(".rec-time").value = rec.time;
+  });
+  refreshRecordCount();
+
+  onInputChanged(); // 载入示例后按当前完整输入自动重算
+}
+
+function clearAll() {
+  // 递增版本号并取消待发的重算：之后在途请求返回也不得恢复结果或错误。
+  inputVersion += 1;
+  reviews.clear(); // 清空同时清掉全部复核记录
+  penalties.clear(); // 同时清掉全部罚秒
+  if (debounceTimer) {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+  }
+  document.getElementById("smMin").value = "";
+  document.getElementById("smMax").value = "";
+  document.getElementById("mfMin").value = "";
+  document.getElementById("mfMax").value = "";
+  runnerRows.innerHTML = "";
+  addRunnerRow();
+  recordRows.innerHTML = "";
+  addRecordRow();
+  clearOutcome(); // 同时清掉结果与错误
+  pendingHint.hidden = true;
+}
+
+document.getElementById("sample-btn").addEventListener("click", loadSample);
+document.getElementById("clear-btn").addEventListener("click", clearAll);
+
+/* ---------- 初始行 ---------- */
+addRunnerRow();
+addRecordRow();
+addRecordRow();
+refreshRunnerButtons();
+refreshRecordCount();
