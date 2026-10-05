@@ -99,7 +99,18 @@ def parse_payload(payload: Any) -> tuple[list[int], dict[str, tuple[int, int]], 
     sm_range = _parse_closed_range(standards, "smMin", "smMax", "起点至中途门")
     mf_range = _parse_closed_range(standards, "mfMin", "mfMax", "中途门至终点")
 
-    runner_rows = _require_list(root.get("runners"), "选手列表")
+    runner_ids = parse_runners(root.get("runners"))
+    records = parse_records(root.get("records"), set(runner_ids))
+    ranges = {"SM": sm_range, "MF": mf_range}
+    return runner_ids, ranges, records
+
+
+def parse_runners(runner_rows: Any) -> list[int]:
+    """解析选手列表（1～3 名、正整数、互异），按输入顺序返回编号。
+
+    供裁决/诊断与设备日志合并预览共用同一套校验。
+    """
+    runner_rows = _require_list(runner_rows, "选手列表")
     if not 1 <= len(runner_rows) <= MAX_RUNNERS:
         raise AdjudicationError(f"选手人数必须为 1～{MAX_RUNNERS} 名")
 
@@ -116,8 +127,16 @@ def parse_payload(payload: Any) -> tuple[list[int], dict[str, tuple[int, int]], 
             raise AdjudicationError(f"选手编号 {rid} 重复")
         seen_runner.add(rid)
         runner_ids.append(rid)
+    return runner_ids
 
-    record_rows = _require_list(root.get("records"), "感应记录列表")
+
+def parse_records(record_rows: Any, valid_runners: set[int]) -> list[Record]:
+    """解析感应记录列表（至多 40 条、ID 唯一、选手已登记、门合法、秒数非负整数）。
+
+    四个字段全空的占位行会被跳过；部分空或任何字段非法均抛出 AdjudicationError。
+    供裁决/诊断与设备日志合并预览共用同一套校验。
+    """
+    record_rows = _require_list(record_rows, "感应记录列表")
     if len(record_rows) > MAX_RECORDS:
         raise AdjudicationError(f"感应记录至多 {MAX_RECORDS} 条")
 
@@ -148,7 +167,7 @@ def parse_payload(payload: Any) -> tuple[list[int], dict[str, tuple[int, int]], 
         seen_ids.add(rid)
 
         runner = _parse_positive_int(runner_raw, f"记录 {rid} 的选手编号")
-        if runner not in seen_runner:
+        if runner not in valid_runners:
             raise AdjudicationError(f"记录 {rid} 的选手编号 {runner} 未登记")
 
         if gate_raw not in GATES:
@@ -156,9 +175,7 @@ def parse_payload(payload: Any) -> tuple[list[int], dict[str, tuple[int, int]], 
 
         time_s = _parse_nonneg_int(time_raw, f"记录 {rid} 的秒数")
         records.append(Record(id=rid, runner=runner, gate=gate_raw, time=time_s))
-
-    ranges = {"SM": sm_range, "MF": mf_range}
-    return runner_ids, ranges, records
+    return records
 
 
 @dataclass(frozen=True)

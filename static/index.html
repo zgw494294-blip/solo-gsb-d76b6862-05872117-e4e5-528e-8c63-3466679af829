@@ -65,6 +65,23 @@
         <p class="hint">记录可乱序、同一秒可有多条；全空行会自动忽略，部分填写视为非法。</p>
       </section>
 
+      <section class="card">
+        <div class="section-head">
+          <h2>4. 从设备日志导入（UTF-8 CSV，表头 id,runner,gate,time，支持引号）</h2>
+        </div>
+        <div class="import-controls">
+          <input type="file" id="import-file" accept=".csv,text/csv" />
+          <button type="button" class="btn secondary" id="import-preview-btn" disabled>预览合并</button>
+          <span id="import-file-name" class="import-file-name">未选择文件</span>
+        </div>
+        <p class="hint">
+          选择文件后经 HTTP 预览新增与重复条目，确认后才追加到上方记录表；
+          同 ID 且内容（选手编号、门、秒数）一致自动跳过，内容冲突、未知选手、非法行或合并后超过 40 条将整批拒绝。
+          预览期间仍可编辑；任一赛道输入或上传文件变化，预览立即失效。
+        </p>
+        <div id="import-box" class="import-box" hidden></div>
+      </section>
+
       <div class="actions">
         <button type="submit" class="btn primary" id="submit-btn">⚖ 裁决 / 重新计算</button>
         <button type="button" class="btn ghost" id="sample-btn">填入示例</button>

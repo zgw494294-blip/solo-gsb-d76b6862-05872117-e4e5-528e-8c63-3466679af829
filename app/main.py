@@ -1,17 +1,18 @@
-"""FastAPI 入口：提供裁决 API 与静态页面。"""
+"""FastAPI 入口：提供裁决 API、设备日志合并预览 API 与静态页面。"""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .adjudication import AdjudicationError, adjudicate, diagnose
+from .merge import MergeError, preview_merge
 
-app = FastAPI(title="本地赛道计次裁决台", version="1.0.0")
+app = FastAPI(title="本地赛道计次裁决台", version="1.1.0")
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -50,6 +51,56 @@ async def api_diagnose(request: Request) -> JSONResponse:
     except AdjudicationError as exc:
         return JSONResponse(status_code=422, content={"ok": False, "error": str(exc)})
     return JSONResponse(content={"ok": True, "result": result})
+
+
+async def _read_json_context(context: str | None) -> object:
+    """读取 multipart 表单中的 context 字段（当前选手与记录表的 JSON）。"""
+    if context is None:
+        raise MergeError("缺少当前记录 context 字段")
+    try:
+        return json.loads(context)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise MergeError("当前记录 context 不是合法的 JSON")
+
+
+async def _handle_merge_request(context: str | None, file: UploadFile | None) -> JSONResponse:
+    if file is None:
+        return JSONResponse(
+            status_code=400, content={"ok": False, "error": "缺少上传的 CSV 文件（file）"}
+        )
+    try:
+        context_obj = await _read_json_context(context)
+        data = await file.read()
+        result = preview_merge(context_obj, data)
+    except MergeError as exc:
+        # 整批拒绝：只返回中文原因，不产生任何合并结果。
+        return JSONResponse(status_code=422, content={"ok": False, "error": str(exc)})
+    except AdjudicationError as exc:
+        # 当前记录本身非法（如选手编号重复、ID 重复）时同样拒绝预览。
+        return JSONResponse(status_code=422, content={"ok": False, "error": str(exc)})
+    return JSONResponse(content={"ok": True, "result": result})
+
+
+@app.post("/api/import/preview")
+async def api_import_preview(
+    context: str | None = Form(default=None), file: UploadFile | None = File(default=None)
+) -> JSONResponse:
+    """设备日志合并预览（只读）：multipart 表单，context 为当前记录 JSON，
+    file 为 UTF-8 CSV。返回新增与重复条目，不修改任何数据。
+    """
+    return await _handle_merge_request(context, file)
+
+
+@app.post("/api/import/confirm")
+async def api_import_confirm(
+    context: str | None = Form(default=None), file: UploadFile | None = File(default=None)
+) -> JSONResponse:
+    """设备日志合并确认：与预览同一套解析与整批校验，返回同样的合并清单。
+
+    服务端不保存状态：真正追加发生在页面端；确认时服务端重新独立校验，
+    只有输入与预览所依据的当前记录、文件内容一致时结果才会与预览相同。
+    """
+    return await _handle_merge_request(context, file)
 
 
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")

@@ -386,6 +386,77 @@ input:focus, select:focus {
 .chip-mini.f { background: var(--chip-f); border-color: #bbf7d0; }
 .empty-line { color: var(--muted); font-size: 0.84rem; }
 
+/* ---------- 设备日志 CSV 导入合并 ---------- */
+.import-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  flex-wrap: wrap;
+}
+.import-file-name { color: var(--muted); font-size: 0.85rem; }
+.import-box {
+  margin-top: 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.7rem 0.9rem;
+  background: #fbfcfe;
+}
+.import-loading {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  color: var(--brand-dark);
+  font-size: 0.9rem;
+}
+.import-error {
+  background: var(--err-bg);
+  border: 1px solid #fecaca;
+  color: var(--err);
+  border-radius: 8px;
+  padding: 0.55rem 0.8rem;
+  font-weight: 600;
+  font-size: 0.88rem;
+}
+.import-done {
+  background: var(--ok-bg);
+  border: 1px solid #a7f3d0;
+  color: var(--ok);
+  border-radius: 8px;
+  padding: 0.55rem 0.8rem;
+  font-weight: 600;
+  font-size: 0.88rem;
+}
+.import-summary { font-size: 0.9rem; margin-bottom: 0.5rem; }
+.import-summary strong { color: var(--ink); }
+.import-table { width: 100%; border-collapse: collapse; margin-bottom: 0.4rem; }
+.import-table th, .import-table td {
+  padding: 0.3rem 0.5rem;
+  text-align: left;
+  font-size: 0.86rem;
+}
+.import-table th {
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-weight: 600;
+  border-bottom: 1px solid var(--line);
+}
+.import-table tbody tr + tr td { border-top: 1px solid #eef1f6; }
+.import-dups { margin: 0.3rem 0 0.5rem; }
+.import-dups summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.83rem;
+}
+.import-dups .dup-line { font-size: 0.82rem; color: var(--muted); margin-top: 0.25rem; }
+.import-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  flex-wrap: wrap;
+  margin-top: 0.6rem;
+}
+.import-action-hint { color: var(--muted); font-size: 0.8rem; }
+
 .footer { text-align: center; color: var(--muted); font-size: 0.8rem; padding: 1rem; }
 
 @media (max-width: 560px) {

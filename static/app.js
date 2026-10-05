@@ -212,6 +212,9 @@ function onInputChanged() {
   pruneReviewsByBindings();
   // 选手编号被修改或选手被删除时，对应罚秒也在此刻立即清除（改回不恢复）。
   prunePenaltiesByRunners();
+  // 任何赛道输入变化（区间、选手、记录，含增删行、示例、清空）都使导入预览失效：
+  // 旧预览的确认入口此刻消失，随后迟到的预览/确认响应也无法恢复它。
+  invalidateImportPreview();
   clearOutcome();
   pendingHint.hidden = false;
   if (debounceTimer) clearTimeout(debounceTimer);
@@ -221,8 +224,26 @@ function onInputChanged() {
   }, DEBOUNCE_MS);
 }
 
-form.addEventListener("input", onInputChanged);
-form.addEventListener("change", onInputChanged);
+// 合并成功后的自动重算：与输入变化一样重跑裁决，但保留“已合并 N 条”的成功提示。
+function rerunAfterMerge() {
+  inputVersion += 1;
+  pruneReviewsByBindings();
+  prunePenaltiesByRunners();
+  clearOutcome();
+  pendingHint.hidden = false;
+  if (debounceTimer) clearTimeout(debounceTimer);
+  runAdjudication();
+}
+
+form.addEventListener("input", (e) => {
+  // 文件选择与导入卡内按钮不属于赛道输入，不触发重算/预览失效。
+  if (eventTargetsImport(e)) return;
+  onInputChanged();
+});
+form.addEventListener("change", (e) => {
+  if (eventTargetsImport(e)) return;
+  onInputChanged();
+});
 
 /* ---------- 收集与提交 ---------- */
 
@@ -1203,6 +1224,366 @@ diagnosisBox.addEventListener("click", (e) => {
   runDiagnosis();
 });
 
+/* ---------- 设备感应日志 CSV 并入（HTTP 预览 → 确认后才追加） ---------- */
+
+// 导入状态机（importState）：
+//   null                      尚无预览 / 预览已失效（确认入口不存在）
+//   {status:"loading-preview"} 预览请求在途
+//   {status:"preview", result, token, snapshot, fileMeta}
+//                             预览成功：显示新增/重复清单与“确认追加”入口
+//   {status:"loading-confirm"} 确认请求在途
+//   {status:"error", message}  预览或确认被服务拒绝/断网（原表不动），可重新预览
+//   {status:"merged", message} 追加成功后的一次性提示（保留至下一次输入/文件变化）
+//
+// 失效规则：任何赛道输入变化（区间、选手、记录，含增删行、示例、清空）或上传文件
+// 变化（重新选择、清空）都立即让预览失效：token 递增、状态清空、确认入口消失；
+// 变化前发出的预览/确认响应无论何时返回（成功、422 或断网）都因 token 守卫被丢弃，
+// 不能恢复确认入口。确认时还会再次核对输入、文件与服务端清单均与预览一致。
+let importState = null;
+let importToken = 0;
+let importFileMeta = null; // 当前选中文件的身份快照（name/size/lastModified）
+let suppressImportFileChange = false; // 合并成功后程序化清空文件时不触发失效
+
+const importFileEl = document.getElementById("import-file");
+const importPreviewBtn = document.getElementById("import-preview-btn");
+const importFileNameEl = document.getElementById("import-file-name");
+const importBox = document.getElementById("import-box");
+
+if (typeof globalThis !== "undefined") {
+  globalThis.__getImportStateForTest = () => importState;
+  globalThis.__importPreviewForTest = () => runImportPreview();
+  globalThis.__importConfirmForTest = () => runImportConfirm();
+}
+
+function currentImportFile() {
+  const files = importFileEl && importFileEl.files;
+  return files && files.length > 0 ? files[0] : null;
+}
+
+function setImportFileMeta() {
+  const f = currentImportFile();
+  importFileMeta = f
+    ? { name: f.name, size: f.size, lastModified: f.lastModified }
+    : null;
+  if (importFileNameEl) {
+    importFileNameEl.textContent = f ? `已选择：${f.name}` : "未选择文件";
+  }
+  if (importPreviewBtn) importPreviewBtn.disabled = !f;
+}
+
+function invalidateImportPreview(keepMessage = false) {
+  importToken += 1;
+  const message =
+    keepMessage && importState && importState.status === "merged"
+      ? importState.message
+      : null;
+  importState = message ? { status: "merged", message } : null;
+  paintImport();
+}
+
+// 预览/确认结果规范化：编号、秒数一律规范十进制字符串（大整数无损解析器已保证
+// 不截断），行号与计数还原为 Number。
+function normalizeImportResult(result) {
+  const normEntry = (e) => ({
+    id: String(e.id),
+    runner:
+      typeof e.runner === "string"
+        ? e.runner.replace(/^0+(?=\d)/, "")
+        : String(e.runner),
+    gate: e.gate,
+    time: intToText(e.time),
+    line: typeof e.line === "string" ? Number(e.line) : e.line,
+  });
+  return {
+    added: (result.added || []).map(normEntry),
+    duplicates: (result.duplicates || []).map(normEntry),
+    existingCount: Number(result.existingCount),
+    mergedCount: Number(result.mergedCount),
+  };
+}
+
+function collectPayloadSnapshot() {
+  // 快照即当前完整裁决载荷（collectPayload 已对 ID 等字段去空白）：
+  // 规范化后的 JSON 文本逐项相等，才视为“输入仍与预览一致”。
+  return JSON.stringify(collectPayload());
+}
+
+async function postImport(endpoint) {
+  const fd = new FormData();
+  fd.set("context", JSON.stringify(collectPayload()));
+  fd.set("file", currentImportFile());
+  let resp;
+  let data;
+  try {
+    resp = await fetch(endpoint, { method: "POST", body: fd });
+    data = parseJsonLossless(await resp.text());
+  } catch (err) {
+    return { networkError: `无法连接导入服务：${err.message}` };
+  }
+  return { resp, data };
+}
+
+async function runImportPreview() {
+  const file = currentImportFile();
+  if (!file) return;
+  const token = ++importToken;
+  importState = { status: "loading-preview", token };
+  paintImport();
+  const outcome = await postImport("/api/import/preview");
+  // 迟到响应：状态已不是本次 loading（输入/文件变化已使其失效），直接丢弃，
+  // 不得渲染错误，更不能恢复确认入口。
+  if (
+    token !== importToken ||
+    !importState ||
+    importState.status !== "loading-preview"
+  ) {
+    return;
+  }
+  if (outcome.networkError) {
+    importState = { status: "error", message: outcome.networkError };
+    paintImport();
+    return;
+  }
+  const { resp, data } = outcome;
+  if (!resp.ok || !data.ok) {
+    // 整批拒绝：展示中文原因，记录表未被改动。
+    importState = {
+      status: "error",
+      message: (data && data.error) || `预览失败（HTTP ${resp.status}）`,
+    };
+    paintImport();
+    return;
+  }
+  importState = {
+    status: "preview",
+    token,
+    result: normalizeImportResult(data.result),
+    snapshot: collectPayloadSnapshot(),
+    fileMeta: { ...importFileMeta },
+  };
+  paintImport();
+}
+
+function isBlankRecordRow(row) {
+  return ["rec-id", "rec-runner", "rec-gate", "rec-time"].every((cls) =>
+    row.querySelector("." + cls).value.trim() === ""
+  );
+}
+
+// 把确认后的新增条目追加到记录表末尾（先复用全空占位行）；
+// 不改动任何旧行与选手、区间，顺序按文件首次出现顺序（服务端已排序）。
+function appendImportedRecords(added) {
+  for (const e of added) {
+    let row = [...recordRows.querySelectorAll(".record-row")].find(isBlankRecordRow);
+    if (!row) {
+      if (recordRows.children.length >= MAX_RECORDS) {
+        throw new Error("记录表没有可容纳新记录的空行");
+      }
+      addRecordRow();
+      row = recordRows.children[recordRows.children.length - 1];
+    }
+    row.querySelector(".rec-id").value = e.id;
+    row.querySelector(".rec-runner").value = e.runner;
+    row.querySelector(".rec-gate").value = e.gate;
+    row.querySelector(".rec-time").value = e.time;
+  }
+  refreshRecordCount();
+}
+
+async function runImportConfirm() {
+  if (!importState || importState.status !== "preview") return;
+  const token = ++importToken;
+  const preview = importState;
+  importState = { status: "loading-confirm", token };
+  paintImport();
+  const outcome = await postImport("/api/import/confirm");
+  // 确认在途时输入/文件变化同样立即使预览失效；迟到的确认响应一律丢弃。
+  if (
+    token !== importToken ||
+    !importState ||
+    importState.status !== "loading-confirm"
+  ) {
+    return;
+  }
+  if (outcome.networkError) {
+    importState = { status: "error", message: outcome.networkError };
+    paintImport();
+    return;
+  }
+  const { resp, data } = outcome;
+  if (!resp.ok || !data.ok) {
+    importState = {
+      status: "error",
+      message: (data && data.error) || `确认失败（HTTP ${resp.status}）`,
+    };
+    paintImport();
+    return;
+  }
+  const result = normalizeImportResult(data.result);
+  // 确认时输入、上传文件与服务端清单都必须仍与预览完全一致；
+  // 任一不一致（含防抖期尚未重算的编辑）都拒绝追加并令预览失效。
+  const file = currentImportFile();
+  const fileUnchanged =
+    file &&
+    preview.fileMeta &&
+    file.name === preview.fileMeta.name &&
+    file.size === preview.fileMeta.size &&
+    file.lastModified === preview.fileMeta.lastModified;
+  const inputUnchanged =
+    preview.snapshot !== undefined &&
+    preview.snapshot === collectPayloadSnapshot();
+  const resultUnchanged =
+    JSON.stringify(result) === JSON.stringify(preview.result);
+  if (!fileUnchanged || !inputUnchanged || !resultUnchanged) {
+    importState = {
+      status: "error",
+      message: "确认时的赛道输入或上传文件已与预览不一致，本次未追加；请重新预览",
+    };
+    paintImport();
+    return;
+  }
+  try {
+    appendImportedRecords(result.added);
+  } catch (err) {
+    importState = { status: "error", message: err.message };
+    paintImport();
+    return;
+  }
+  const nAdd = result.added.length;
+  const nDup = result.duplicates.length;
+  importState = {
+    status: "merged",
+    message:
+      `已追加 ${nAdd} 条新记录（跳过 ${nDup} 条重复），合并后共 ${result.mergedCount} 条；` +
+      "已按合并后的记录自动裁决，选手与区间未改动",
+  };
+  paintImport();
+  // 追加完成：程序化清空文件选择（抑制其 change 事件，避免清掉成功提示）。
+  if (importFileEl) {
+    suppressImportFileChange = true;
+    importFileEl.value = "";
+    suppressImportFileChange = false;
+  }
+  setImportFileMeta();
+  // 成功合并触发自动裁决：复核、罚秒与诊断沿用原失效规则
+  // （rerunAfterMerge 不触碰 merged 成功提示）。
+  rerunAfterMerge();
+}
+
+function importEntriesTableHtml(entries, emptyText) {
+  if (entries.length === 0) return `<div class="empty-line">${emptyText}</div>`;
+  const body = entries
+    .map(
+      (e) =>
+        `<tr><td>${escapeHtml(e.id)}</td><td>${e.runner}</td>` +
+        `<td>${GATE_LABELS[e.gate]}</td><td>${e.time} 秒</td><td>第 ${e.line} 行</td></tr>`
+    )
+    .join("");
+  return `<table class="import-table">
+    <thead><tr><th>记录 ID</th><th>选手编号</th><th>门</th><th>秒数</th><th>文件位置</th></tr></thead>
+    <tbody>${body}</tbody>
+  </table>`;
+}
+
+function importDuplicatesHtml(entries) {
+  if (entries.length === 0) return "";
+  const lines = entries
+    .map(
+      (e) =>
+        `<div class="dup-line">第 ${e.line} 行 · ${escapeHtml(e.id)} · 选手 ${e.runner} · ` +
+        `${GATE_LABELS[e.gate]} · ${e.time} 秒</div>`
+    )
+    .join("");
+  return `<details class="import-dups"><summary>跳过的重复条目 ${entries.length} 条（同 ID 且内容一致）</summary>${lines}</details>`;
+}
+
+function paintImport() {
+  if (!importBox) return;
+  if (!importState) {
+    importBox.hidden = true;
+    importBox.innerHTML = "";
+    return;
+  }
+  switch (importState.status) {
+    case "loading-preview":
+      importBox.innerHTML = `
+        <div class="import-loading">
+          <span class="diag-spinner" aria-hidden="true"></span>
+          正在经 HTTP 预览新增与重复条目…（预览不改动记录表）
+        </div>`;
+      break;
+    case "preview": {
+      const r = importState.result;
+      importBox.innerHTML = `
+        <div class="import-summary">
+          现有 <strong>${r.existingCount}</strong> 条，文件新增
+          <strong>${r.added.length}</strong> 条，重复跳过
+          <strong>${r.duplicates.length}</strong> 条，合并后
+          <strong>${r.mergedCount}</strong> 条（上限 ${MAX_RECORDS} 条）。
+        </div>
+        <div class="subsection"><h4>确认后将新增（按文件首次出现顺序追加到末尾）</h4>
+          ${importEntriesTableHtml(r.added, "（没有新增记录，文件条目与现有记录全部一致）")}
+        </div>
+        ${importDuplicatesHtml(r.duplicates)}
+        <div class="import-actions">
+          <button type="button" class="btn primary import-confirm">✓ 确认追加 ${r.added.length} 条并自动裁决</button>
+          <button type="button" class="btn ghost import-cancel">取消预览</button>
+          <span class="import-action-hint">预览期间仍可编辑；任一赛道输入或上传文件变化立即使本预览失效，确认时还会再次核对。</span>
+        </div>`;
+      break;
+    }
+    case "loading-confirm":
+      importBox.innerHTML = `
+        <div class="import-loading">
+          <span class="diag-spinner" aria-hidden="true"></span>
+          正在经 HTTP 复核并追加…等待期间仍可编辑，编辑即令本次确认失效。
+        </div>`;
+      break;
+    case "error":
+      importBox.innerHTML = `
+        <div class="import-error">⚠ ${escapeHtml(importState.message)}</div>
+        <div class="import-actions">
+          <button type="button" class="btn secondary import-retry">重新预览</button>
+          <span class="import-action-hint">整批拒绝：记录表、复核与罚秒均保持原样未改动。</span>
+        </div>`;
+      break;
+    case "merged":
+      importBox.innerHTML = `<div class="import-done">✓ ${escapeHtml(importState.message)}</div>`;
+      break;
+  }
+  importBox.hidden = false;
+}
+
+// 旧生命周期测试的 DOM 桩没有导入控件：元素缺失时整个导入交互不挂载，
+// 但 invalidateImportPreview 等函数仍可被安全调用（no-op 重绘）。
+if (importFileEl) {
+  setImportFileMeta();
+  importFileEl.addEventListener("change", () => {
+    // 上传文件变化（重新选择、清空选择）：立即登记新身份并令旧预览失效，
+    // 迟到响应无法恢复确认入口。程序化清空（合并成功后）除外。
+    setImportFileMeta();
+    if (!suppressImportFileChange) invalidateImportPreview();
+  });
+  importPreviewBtn.addEventListener("click", runImportPreview);
+  importBox.addEventListener("click", (e) => {
+    if (e.target.classList.contains("import-confirm")) runImportConfirm();
+    else if (e.target.classList.contains("import-cancel")) invalidateImportPreview();
+    else if (e.target.classList.contains("import-retry")) runImportPreview();
+  });
+  paintImport();
+}
+
+// 表单的 input/change 监听不得把文件选择与导入卡内的操作误判为赛道输入变化。
+function eventTargetsImport(e) {
+  return (
+    (importFileEl && e.target === importFileEl) ||
+    (importPreviewBtn && e.target === importPreviewBtn) ||
+    (importBox &&
+      typeof importBox.contains === "function" &&
+      importBox.contains(e.target))
+  );
+}
+
 /* ---------- 工具 ---------- */
 
 function escapeHtml(s) {
@@ -1241,9 +1622,25 @@ const SAMPLE = {
   ],
 };
 
+function resetImportUi() {
+  // 清空/载入示例：上传文件与合并预览一并清除（不恢复旧预览）。
+  if (importFileEl) {
+    suppressImportFileChange = true;
+    importFileEl.value = "";
+    suppressImportFileChange = false;
+  }
+  importFileMeta = null;
+  if (importFileNameEl) importFileNameEl.textContent = "未选择文件";
+  if (importPreviewBtn) importPreviewBtn.disabled = true;
+  importState = null;
+  importToken += 1;
+  paintImport();
+}
+
 function loadSample() {
   reviews.clear(); // 载入示例同时清掉全部复核记录
   penalties.clear(); // 同时清掉全部罚秒
+  resetImportUi(); // 同时清除上传文件与导入预览
   document.getElementById("smMin").value = SAMPLE.smMin;
   document.getElementById("smMax").value = SAMPLE.smMax;
   document.getElementById("mfMin").value = SAMPLE.mfMin;
@@ -1272,6 +1669,7 @@ function clearAll() {
   inputVersion += 1;
   reviews.clear(); // 清空同时清掉全部复核记录
   penalties.clear(); // 同时清掉全部罚秒
+  resetImportUi(); // 同时清除上传文件与导入预览
   if (debounceTimer) {
     clearTimeout(debounceTimer);
     debounceTimer = null;
