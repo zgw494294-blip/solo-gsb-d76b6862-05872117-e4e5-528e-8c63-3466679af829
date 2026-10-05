@@ -75,6 +75,9 @@ const errorBox = document.getElementById("error-box");
 const pendingHint = document.getElementById("pending-hint");
 const resultsBox = document.getElementById("results");
 const diagnosisBox = document.getElementById("diagnosis-box");
+const mergeFileInput = document.getElementById("merge-file");
+const mergePreviewBtn = document.getElementById("merge-preview-btn");
+const mergePanel = document.getElementById("merge-panel");
 
 /* ---------- 行管理 ---------- */
 
@@ -183,6 +186,7 @@ function clearOutcome() {
   renderedLapKeys = []; // 结果区已清空，旧的趟键索引全部失效
   latestResult = null; // 名次表随之隐藏，等待最新合法结果
   closeDiagnosis(); // 诊断附属于当前裁决结果：输入一改即清除，非法/重算期间不可检查
+  invalidateMerge("赛道输入已变化，预览已失效，请重新预览"); // 合并预览同样绑定当前输入，一改即失效
 }
 
 /* ---------- 未采纳记录替代性诊断（HTTP 只读分析，不改变采纳/复核/罚秒/名次） ---------- */
@@ -1203,6 +1207,369 @@ diagnosisBox.addEventListener("click", (e) => {
   runDiagnosis();
 });
 
+/* ---------- 设备 CSV 并入（HTTP 预览 → 确认后才追加；预览随输入/文件立即失效） ---------- */
+
+// 合并状态机：
+//   idle       未选择文件：无面板
+//   loading    预览请求在途
+//   ready      预览成功：展示新增/重复，可确认追加或放弃
+//   confirming 确认请求在途
+//   error      预览/确认失败（整批拒绝，含 422 中文原因或断网），可保留文件重新预览
+//   stale      预览成功后赛道输入或文件发生变化：确认入口不可用，只能重新预览/放弃
+//
+// 失效语义与裁决/诊断同一套版本守卫：任何赛道输入（form 的 onInputChanged →
+// clearOutcome → invalidateMerge）或重新选择文件都递增 mergeVersion；
+// 在途的预览/确认无论何时返回（成功、422、断网），版本不符一律丢弃，
+// 迟到响应既不能恢复确认入口，也不能覆盖较新状态。确认时服务端还会重算
+// 请求体指纹与预览令牌比对：输入与预览不一致同样 422 拒绝。
+let mergeState = { status: "idle" };
+let mergeVersion = 0;
+let mergeCsvText = null; // 当前所选文件的 UTF-8 文本（未选择/放弃时为 null）
+let mergeFileHandle = null; // 最近选择的 File 对象：读取失败时“重新预览”可重读
+
+// 仅供无浏览器生命周期测试直接读取合并状态机。
+if (typeof globalThis !== "undefined") {
+  globalThis.__getMergeStateForTest = () => mergeState;
+  globalThis.__getMergeVersionForTest = () => mergeVersion;
+}
+
+const MERGE_SKIP_LABELS = {
+  file: "文件内重复（与同 ID 首次出现一致，跳过）",
+  existing: "与现有记录一致（跳过）",
+};
+
+function readCsvFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      let text = String(reader.result);
+      if (text.charCodeAt(0) === 0xfeff) text = text.slice(1); // 去 UTF-8 BOM，与服务端一致
+      resolve(text);
+    };
+    reader.onerror = () => reject(new Error("无法读取该文件"));
+    reader.readAsText(file, "utf-8");
+  });
+}
+
+function setMergeState(next) {
+  mergeState = next;
+  paintMerge();
+}
+
+// 赛道输入变化时调用（clearOutcome 内）：成功预览之后的状态降级为 stale；
+// loading/confirming 的在途响应由 mergeVersion 守卫丢弃，状态也切到 stale，
+// 由响应到达时不再回写；error 状态下改输入，保留原因并要求重新预览。
+function invalidateMerge(reason) {
+  mergeVersion += 1;
+  if (mergeState.status === "idle") return;
+  setMergeState({ status: "stale", reason, prev: mergeState });
+}
+
+function mergeBody(csvText) {
+  // 预览/确认发送同一份完整裁决载荷 + csv 原文；不新增解析，服务端按同一套规则校验。
+  const body = collectPayload();
+  body.csv = csvText;
+  return body;
+}
+
+function normalizeMergeResult(result) {
+  // 编号与秒数同样规范为十进制字符串：超过 2^53 也精确展示、精确去重。
+  const normItem = (item) => {
+    if (!(item.gate in GATE_LABELS) || typeof item.id !== "string") {
+      throw new Error("合并服务返回了无法识别的记录");
+    }
+    return {
+      ...item,
+      runner: intToText(item.runner),
+      time: intToText(item.time),
+    };
+  };
+  if (!Array.isArray(result.added) || !Array.isArray(result.skipped)) {
+    throw new Error("合并服务返回格式不正确");
+  }
+  result.added = result.added.map(normItem);
+  result.skipped = result.skipped.map(normItem);
+  for (const k of ["existingCount", "addedCount", "skippedCount", "totalAfter"]) {
+    result[k] = Number(result[k]);
+  }
+  return result;
+}
+
+function mergeRowText(item) {
+  return `${GATE_LABELS[item.gate]} · 选手 ${item.runner} · ${item.time} 秒`;
+}
+
+function mergeListHtml(items, kind) {
+  if (items.length === 0) return `<div class="empty-line">（无）</div>`;
+  return `<ul class="merge-list merge-list-${kind}">${items
+    .map((item) => {
+      const extra =
+        item.reason === "file"
+          ? ` · ${MERGE_SKIP_LABELS.file}（第 ${item.duplicateOfLine} 行）`
+          : item.reason === "existing"
+            ? ` · ${MERGE_SKIP_LABELS.existing}`
+            : "";
+      return `<li>
+        <span class="chip-mini ${item.gate}">${escapeHtml(item.id)}</span>
+        <span class="merge-row-detail">${mergeRowText(item)}</span>
+        <span class="merge-line">文件第 ${item.line} 行${extra}</span>
+      </li>`;
+    })
+    .join("")}</ul>`;
+}
+
+function mergeLoadingHtml(title) {
+  return `
+    <div class="diag-loading">
+      <span class="diag-spinner" aria-hidden="true"></span>${title}
+    </div>`;
+}
+
+function mergeReadyHtml(result, confirming) {
+  const counts = `
+    现有 <strong>${result.existingCount}</strong> 条 ·
+    新增 <strong>${result.addedCount}</strong> 条 ·
+    跳过重复 <strong>${result.skippedCount}</strong> 条 ·
+    合并后共 <strong>${result.totalAfter}</strong> 条（上限 ${MAX_RECORDS}）`;
+  return `
+    <div class="merge-summary">${counts}</div>
+    <div class="merge-cols">
+      <div class="merge-col">
+        <h4>将新增（${result.addedCount} 条，按文件首次出现顺序追加，不改选手和区间）</h4>
+        ${mergeListHtml(result.added, "added")}
+      </div>
+      <div class="merge-col">
+        <h4>重复跳过（${result.skippedCount} 条，编号/秒数按精确整数比对，ID 沿用去空白规则）</h4>
+        ${mergeListHtml(result.skipped, "skipped")}
+      </div>
+    </div>
+    <div class="diag-actions">
+      <button type="button" class="btn primary merge-confirm" ${confirming ? "disabled" : ""}>
+        ${confirming ? "正在确认追加…" : "✓ 确认追加"}
+      </button>
+      <button type="button" class="btn ghost merge-dismiss" ${confirming ? "disabled" : ""}>放弃</button>
+      <span class="diag-action-hint">确认时服务端仍会比对当前输入与预览；旧记录顺序不变。</span>
+    </div>`;
+}
+
+function mergeErrorHtml(message, status) {
+  return `
+    <div class="diag-error">⚠ ${escapeHtml(message)}</div>
+    <div class="merge-error-hint">整批拒绝：未追加任何记录，原表、复核与罚秒均保留。</div>
+    <div class="diag-actions">
+      <button type="button" class="btn secondary merge-retry">重新预览</button>
+      <button type="button" class="btn ghost merge-dismiss">放弃并清除文件</button>
+    </div>`;
+}
+
+function mergeStaleHtml(state) {
+  return `
+    <div class="merge-stale">
+      <strong>预览已失效：${escapeHtml(state.reason)}</strong>
+    </div>
+    <div class="diag-actions">
+      <button type="button" class="btn secondary merge-retry">重新预览</button>
+      <button type="button" class="btn ghost merge-dismiss">放弃</button>
+    </div>`;
+}
+
+function paintMerge() {
+  const st = mergeState.status;
+  if (st === "idle") {
+    mergePanel.hidden = true;
+    mergePanel.innerHTML = "";
+  } else {
+    mergePanel.hidden = false;
+    switch (st) {
+      case "loading":
+        mergePanel.innerHTML = mergeLoadingHtml("正在经 HTTP 预览 CSV 新增 / 重复条目…");
+        break;
+      case "confirming":
+        mergePanel.innerHTML = mergeReadyHtml(mergeState.result, true);
+        break;
+      case "ready":
+        mergePanel.innerHTML = mergeReadyHtml(mergeState.result, false);
+        break;
+      case "error":
+        mergePanel.innerHTML = mergeErrorHtml(mergeState.message);
+        break;
+      case "stale":
+        mergePanel.innerHTML = mergeStaleHtml(mergeState);
+        break;
+    }
+  }
+  // 有文件文本可重新发起预览，或仅有文件句柄（上次读取失败）可重新读取时按钮可用。
+  const canRetry = mergeCsvText !== null || mergeFileHandle !== null;
+  mergePreviewBtn.disabled = !canRetry || st === "loading" || st === "confirming";
+}
+
+async function requestMergePreview(csvText) {
+  const version = mergeVersion;
+  setMergeState({ status: "loading" });
+  let resp;
+  let data;
+  try {
+    resp = await fetch("/api/merge/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(mergeBody(csvText)),
+    });
+    data = parseJsonLossless(await resp.text());
+  } catch (err) {
+    // 迟到的失败不能恢复确认入口、不能覆盖较新状态。
+    if (version !== mergeVersion) return;
+    setMergeState({ status: "error", message: `无法连接合并服务：${err.message}` });
+    return;
+  }
+  if (version !== mergeVersion) return; // 输入或文件已变：丢弃迟到成功
+  if (!resp.ok || !data.ok) {
+    setMergeState({ status: "error", message: (data && data.error) || `预览失败（HTTP ${resp.status}）` });
+    return;
+  }
+  try {
+    normalizeMergeResult(data.result);
+  } catch (err) {
+    setMergeState({ status: "error", message: err.message });
+    return;
+  }
+  setMergeState({ status: "ready", csvText, result: data.result });
+}
+
+// 把确认返回的新记录写入表格：先复用现有全空行，再按需新增行；
+// 有效记录总数由服务端保证不超过 40，因此这里 addRecordRow 不会触顶。
+function applyMergedRecords(added) {
+  const rows = [...recordRows.querySelectorAll(".record-row")];
+  const isBlank = (row) =>
+    row.querySelector(".rec-id").value.trim() === "" &&
+    row.querySelector(".rec-runner").value.trim() === "" &&
+    row.querySelector(".rec-gate").value === "" &&
+    row.querySelector(".rec-time").value.trim() === "";
+  for (const item of added) {
+    let row = rows.find((r) => isBlank(r) && !r.dataset.mergeUsed);
+    if (!row) {
+      addRecordRow();
+      row = recordRows.children[recordRows.children.length - 1];
+    }
+    row.dataset.mergeUsed = "1";
+    row.querySelector(".rec-id").value = item.id;
+    row.querySelector(".rec-runner").value = item.runner;
+    row.querySelector(".rec-time").value = item.time;
+    row.querySelector(".rec-gate").value = item.gate;
+  }
+  for (const row of recordRows.querySelectorAll(".record-row")) delete row.dataset.mergeUsed;
+  refreshRecordCount();
+}
+
+async function requestMergeConfirm() {
+  if (mergeState.status !== "ready") return;
+  const { csvText, result } = mergeState;
+  const version = mergeVersion;
+  setMergeState({ status: "confirming", csvText, result });
+  let resp;
+  let data;
+  try {
+    const body = mergeBody(csvText);
+    body.token = result.token;
+    resp = await fetch("/api/merge/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    data = parseJsonLossless(await resp.text());
+  } catch (err) {
+    if (version !== mergeVersion) return;
+    setMergeState({ status: "error", message: `无法连接合并服务：${err.message}` });
+    return;
+  }
+  if (version !== mergeVersion) return;
+  if (!resp.ok || !data.ok) {
+    // 令牌失配等：不追加，按整批拒绝提示；输入须与预览一致，重新预览即可。
+    setMergeState({ status: "error", message: (data && data.error) || `确认失败（HTTP ${resp.status}）` });
+    return;
+  }
+  // 成功合并：先复位合并状态并清掉已消费的文件，再写入表格。
+  let applied;
+  try {
+    applied = normalizeMergeResult(data.result).added;
+  } catch (err) {
+    setMergeState({ status: "error", message: err.message });
+    return;
+  }
+  mergeCsvText = null;
+  mergeFileHandle = null;
+  mergeFileInput.value = "";
+  setMergeState({ status: "idle" });
+  applyMergedRecords(applied);
+  // 触发自动裁决（防抖 350ms）：复核即时剪枝、罚秒按编号规则保留、诊断随裁决失效。
+  onInputChanged();
+}
+
+function resetMergeFile() {
+  mergeVersion += 1;
+  mergeCsvText = null;
+  mergeFileHandle = null;
+  mergeFileInput.value = "";
+  setMergeState({ status: "idle" });
+}
+
+// 供“清空 / 填入示例”调用：它们本身已经在重置整张表，无需再额外递增版本
+// （随后的 onInputChanged 会再做一次失效），只复位文件选择与面板。
+function resetMergeFileQuiet() {
+  mergeCsvText = null;
+  mergeFileHandle = null;
+  mergeFileInput.value = "";
+  setMergeState({ status: "idle" });
+}
+
+async function loadChosenFile(file, version) {
+  mergeCsvText = ""; // 占位：读取期间禁用预览，防止拿旧文本发起请求
+  setMergeState({ status: "loading" });
+  let text;
+  try {
+    text = await readCsvFile(file);
+  } catch (err) {
+    if (version !== mergeVersion) return; // 读取期间又换了文件：迟到结果丢弃
+    mergeCsvText = null; // 保留 mergeFileHandle：错误态的“重新预览”可重试读取
+    setMergeState({ status: "error", message: err.message });
+    return;
+  }
+  if (version !== mergeVersion) return; // 读取期间又换了文件：迟到结果丢弃
+  mergeCsvText = text;
+  requestMergePreview(text);
+}
+
+mergeFileInput.addEventListener("change", () => {
+  // 重新选择（或清空）文件：旧预览立即失效，在途响应一律作废；新文件自动预览。
+  const version = ++mergeVersion;
+  const file = mergeFileInput.files && mergeFileInput.files[0];
+  if (!file) {
+    mergeCsvText = null;
+    mergeFileHandle = null;
+    setMergeState({ status: "idle" });
+    return;
+  }
+  mergeFileHandle = file;
+  loadChosenFile(file, version);
+});
+
+mergePreviewBtn.addEventListener("click", () => {
+  if (mergeCsvText) requestMergePreview(mergeCsvText);
+  else if (mergeFileHandle) loadChosenFile(mergeFileHandle, mergeVersion); // 上次读取失败：重试读取
+});
+
+mergePanel.addEventListener("click", (e) => {
+  const cls = e.target.classList;
+  if (cls.contains("merge-confirm")) {
+    requestMergeConfirm();
+  } else if (cls.contains("merge-retry")) {
+    if (mergeCsvText) requestMergePreview(mergeCsvText);
+    else if (mergeFileHandle) loadChosenFile(mergeFileHandle, mergeVersion); // 读取失败后重试
+  } else if (cls.contains("merge-dismiss")) {
+    // 放弃：移除已选文件并彻底复位（成功预览未确认，表格从未被修改）。
+    resetMergeFile();
+  }
+});
+
 /* ---------- 工具 ---------- */
 
 function escapeHtml(s) {
@@ -1244,6 +1611,7 @@ const SAMPLE = {
 function loadSample() {
   reviews.clear(); // 载入示例同时清掉全部复核记录
   penalties.clear(); // 同时清掉全部罚秒
+  resetMergeFileQuiet(); // 示例即新输入：未确认的 CSV 预览与所选文件一并清除
   document.getElementById("smMin").value = SAMPLE.smMin;
   document.getElementById("smMax").value = SAMPLE.smMax;
   document.getElementById("mfMin").value = SAMPLE.mfMin;
@@ -1272,6 +1640,7 @@ function clearAll() {
   inputVersion += 1;
   reviews.clear(); // 清空同时清掉全部复核记录
   penalties.clear(); // 同时清掉全部罚秒
+  resetMergeFileQuiet(); // 清空：未确认的 CSV 预览与所选文件一并清除
   if (debounceTimer) {
     clearTimeout(debounceTimer);
     debounceTimer = null;

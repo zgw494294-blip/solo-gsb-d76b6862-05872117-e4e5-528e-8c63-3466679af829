@@ -158,6 +158,9 @@ const results = mk("results");
 mk("diagnosis-box");
 for (const id of ["smMin", "smMax", "mfMin", "mfMax"]) mk(id, "input");
 mk("sample-btn", "button"); mk("clear-btn", "button");
+mk("merge-file", "input").files = null;
+mk("merge-preview-btn", "button");
+mk("merge-panel");
 
 // 静态层级：所有控件挂在 form 下，输入事件可冒泡到 form 监听器（与真实 DOM 一致）。
 for (const id of ["smMin", "smMax", "mfMin", "mfMax"]) form.appendChild(byId.get(id));

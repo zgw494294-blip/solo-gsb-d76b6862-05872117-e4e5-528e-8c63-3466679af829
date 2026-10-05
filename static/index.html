@@ -73,6 +73,22 @@
       <p class="hint">修改任意输入（含增删行、填入示例）后会自动重算，无需点击按钮；上方按钮可随时手动重算。</p>
     </form>
 
+    <section class="card" id="merge-card">
+      <div class="section-head">
+        <h2>4. 并入设备导出的感应日志（UTF-8 CSV）</h2>
+        <div>
+          <input type="file" id="merge-file" accept=".csv,text/csv" />
+          <button type="button" id="merge-preview-btn" class="btn secondary" disabled>预览新增 / 重复</button>
+        </div>
+      </div>
+      <p class="hint">
+        表头必须恰好为 <code>id,runner,gate,time</code>，支持双引号包裹（字段内含逗号、引号或换行均可）。
+        选择文件后经 HTTP 预览<strong>新增</strong>与<strong>重复</strong>条目，确认后才会追加；同 ID 内容一致自动跳过，
+        内容冲突、未知选手、非法行或合并后超过 40 条将整批拒绝。预览期间仍可编辑表格，但任何赛道输入或重新选择文件都会立即使预览失效。
+      </p>
+      <div id="merge-panel" class="merge-panel" hidden></div>
+    </section>
+
     <div id="error-box" class="error-box" hidden></div>
     <div id="pending-hint" class="pending-hint" hidden>正在根据当前输入自动重新计算…</div>
     <div id="results"></div>

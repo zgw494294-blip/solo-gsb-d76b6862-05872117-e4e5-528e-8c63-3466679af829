@@ -177,6 +177,9 @@ diagnosisBox.hidden = true; // 真实 HTML 中带 hidden 属性
 for (const id of ["smMin", "smMax", "mfMin", "mfMax"]) mk(id, "input");
 const sampleBtn = mk("sample-btn", "button");
 const clearBtn = mk("clear-btn", "button");
+mk("merge-file", "input").files = null;
+mk("merge-preview-btn", "button");
+mk("merge-panel");
 
 for (const id of ["smMin", "smMax", "mfMin", "mfMax"]) form.appendChild(byId.get(id));
 form.appendChild(runnerRows);

@@ -173,6 +173,9 @@ const results = mk("results");
 mk("diagnosis-box");
 for (const id of ["smMin", "smMax", "mfMin", "mfMax"]) mk(id, "input");
 mk("sample-btn", "button"); mk("clear-btn", "button");
+mk("merge-file", "input").files = null;
+mk("merge-preview-btn", "button");
+mk("merge-panel");
 
 for (const id of ["smMin", "smMax", "mfMin", "mfMax"]) form.appendChild(byId.get(id));
 form.appendChild(runnerRows);
